@@ -204,22 +204,23 @@ class DatasetManager(object):
 
     self._epochs_completed += 1
 
-  def data_generator(self):
+  def data_generator(self, epochs_between_evals):
     """Yields examples during local training."""
     assert not self._stream_files
 
     if self._is_training:
-      for _ in range(self._batches_per_epoch):
+      for _ in range(self._batches_per_epoch * epochs_between_evals):
         yield self._result_queue.get(timeout=300)
 
     else:
       # Evaluation waits for all data to be ready.
       self._result_queue.put(self._result_queue.get(timeout=300))
       assert len(self._result_reuse) == self._batches_per_epoch
+      assert epochs_between_evals == 1
       for i in self._result_reuse:
         yield i
 
-  def get_dataset(self, batch_size):
+  def get_dataset(self, batch_size, epochs_between_evals):
     """Construct the dataset to be used for training and eval.
 
     For local training, data is provided through Dataset.from_generator. For
@@ -228,9 +229,14 @@ class DatasetManager(object):
 
     Args:
       batch_size: The per-device batch size of the dataset.
+      epochs_between_evals: How many epochs worth of data to yield.
+        (Generator mode only.)
     """
     self._epochs_requested += 1
     if self._stream_files:
+      if epochs_between_evals > 1:
+        raise ValueError("epochs_between_evals > 1 not supported for file "
+                         "based dataset.")
       epoch_data_dir = self._result_queue.get(timeout=300)
       if not self._is_training:
         self._result_queue.put(epoch_data_dir)  # Eval data is reused.
@@ -260,8 +266,10 @@ class DatasetManager(object):
         types[rconst.DUPLICATE_MASK] = np.bool
         shapes[rconst.DUPLICATE_MASK] = tf.TensorShape([batch_size])
 
+      data_generator = functools.partial(
+          self.data_generator, epochs_between_evals=epochs_between_evals)
       dataset = tf.data.Dataset.from_generator(
-          generator=self.data_generator, output_types=types,
+          generator=data_generator, output_types=types,
           output_shapes=shapes)
 
     return dataset.prefetch(16)
@@ -276,7 +284,10 @@ class DatasetManager(object):
         raise ValueError("producer batch size ({}) differs from params batch "
                          "size ({})".format(batch_size, param_batch_size))
 
-      return self.get_dataset(batch_size=batch_size)
+      epochs_between_evals = (params.get("epochs_between_evals", 1)
+                              if self._is_training else 1)
+      return self.get_dataset(batch_size=batch_size,
+                              epochs_between_evals=epochs_between_evals)
 
     return input_fn
 
@@ -296,6 +307,8 @@ class BaseDataConstructor(threading.Thread):
                maximum_number_epochs,   # type: int
                num_users,               # type: int
                num_items,               # type: int
+               user_map,                # type: dict
+               item_map,                # type: dict
                train_pos_users,         # type: np.ndarray
                train_pos_items,         # type: np.ndarray
                train_batch_size,        # type: int
@@ -311,6 +324,8 @@ class BaseDataConstructor(threading.Thread):
     self._maximum_number_epochs = maximum_number_epochs
     self._num_users = num_users
     self._num_items = num_items
+    self.user_map = user_map
+    self.item_map = item_map
     self._train_pos_users = train_pos_users
     self._train_pos_items = train_pos_items
     self.train_batch_size = train_batch_size
@@ -361,6 +376,7 @@ class BaseDataConstructor(threading.Thread):
     super(BaseDataConstructor, self).__init__()
     self.daemon = True
     self._stop_loop = False
+    self._fatal_exception = None
 
   def __repr__(self):
     multiplier = ("(x{} devices)".format(self._batches_per_train_step)
@@ -410,17 +426,19 @@ class BaseDataConstructor(threading.Thread):
   def run(self):
     try:
       self._run()
-    except Exception:
+    except Exception as e:
       # The Thread base class swallows stack traces, so unfortunately it is
       # necessary to catch and re-raise to get debug output
       print(traceback.format_exc(), file=sys.stderr)
+      self._fatal_exception = e
       sys.stderr.flush()
       raise
 
   def _start_shuffle_iterator(self):
     pool = popen_helper.get_forkpool(3, closing=False)
     atexit.register(pool.close)
-    args = [self._elements_in_epoch for _ in range(self._maximum_number_epochs)]
+    args = [(self._elements_in_epoch, stat_utils.random_int32())
+            for _ in range(self._maximum_number_epochs)]
     self._shuffle_iterator = pool.imap_unordered(stat_utils.permutation, args)
 
   def _get_training_batch(self, i):
@@ -545,7 +563,7 @@ class BaseDataConstructor(threading.Thread):
     users = np.repeat(self._eval_pos_users[low_index:high_index, np.newaxis],
                       1 + rconst.NUM_EVAL_NEGATIVES, axis=1)
     positive_items = self._eval_pos_items[low_index:high_index, np.newaxis]
-    negative_items = (self.lookup_negative_items(negative_users=users[:, -1])
+    negative_items = (self.lookup_negative_items(negative_users=users[:, :-1])
                       .reshape(-1, rconst.NUM_EVAL_NEGATIVES))
 
     users, items, duplicate_mask = self._assemble_eval_batch(
@@ -574,6 +592,10 @@ class BaseDataConstructor(threading.Thread):
         timeit.default_timer() - start_time))
 
   def make_input_fn(self, is_training):
+    if self._fatal_exception is not None:
+      raise ValueError("Fatal exception in the data production loop: {}"
+                       .format(self._fatal_exception))
+
     return (
         self._train_dataset.make_input_fn(self.train_batch_size) if is_training
         else self._eval_dataset.make_input_fn(self.eval_batch_size))
@@ -671,7 +693,8 @@ class MaterializedDataConstructor(BaseDataConstructor):
     start_time = timeit.default_timer()
     inner_bounds = np.argwhere(self._train_pos_users[1:] -
                                self._train_pos_users[:-1])[:, 0] + 1
-    index_bounds = [0] + inner_bounds.tolist() + [self._num_users]
+    upper_bound = self._train_pos_users.shape[0]
+    index_bounds = [0] + inner_bounds.tolist() + [upper_bound]
     self._negative_table = np.zeros(shape=(self._num_users, self._num_items),
                                     dtype=rconst.ITEM_DTYPE)
 

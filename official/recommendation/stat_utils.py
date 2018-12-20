@@ -36,8 +36,9 @@ def random_int32():
   return np.random.randint(low=0, high=np.iinfo(np.int32).max, dtype=np.int32)
 
 
-def permutation(x):
-  seed = struct.unpack("<L", os.urandom(4))[0]
+def permutation(args):
+  x, seed = args
+  seed = seed or struct.unpack("<L", os.urandom(4))[0]
   state = np.random.RandomState(seed=seed)  # pylint: disable=no-member
   output = np.arange(x, dtype=np.int32)
   state.shuffle(output)

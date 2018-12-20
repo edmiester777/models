@@ -177,6 +177,7 @@ def parse_flags(flags_obj):
       "epsilon": flags_obj.epsilon,
       "match_mlperf": flags_obj.ml_perf,
       "use_xla_for_gpu": flags_obj.use_xla_for_gpu,
+      "epochs_between_evals": FLAGS.epochs_between_evals,
   }
 
 
@@ -207,8 +208,7 @@ def run_ncf(_):
   else:
     num_users, num_items, producer = data_preprocessing.instantiate_pipeline(
         dataset=FLAGS.dataset, data_dir=FLAGS.data_dir,
-        match_mlperf=FLAGS.ml_perf, deterministic=FLAGS.seed is not None,
-        params=params)
+        deterministic=FLAGS.seed is not None, params=params)
 
     num_train_steps = (producer.train_batches_per_epoch //
                        params["batches_per_step"])

@@ -57,11 +57,11 @@ DATASET_TO_NUM_USERS_AND_ITEMS = {
 
 _EXPECTED_CACHE_KEYS = (
     rconst.TRAIN_USER_KEY, rconst.TRAIN_ITEM_KEY, rconst.EVAL_USER_KEY,
-    rconst.EVAL_ITEM_KEY, rconst.USER_MAP, rconst.ITEM_MAP)
+    rconst.EVAL_ITEM_KEY, rconst.USER_MAP, rconst.ITEM_MAP, "match_mlperf")
 
 
 def _filter_index_sort(raw_rating_path, cache_path, match_mlperf):
-  # type: (str, str, bool) -> dict
+  # type: (str, str, bool) -> (dict, bool)
   """Read in data CSV, and output structured data.
 
   This function reads in the raw CSV of positive items, and performs three
@@ -86,6 +86,7 @@ def _filter_index_sort(raw_rating_path, cache_path, match_mlperf):
 
   Args:
     raw_rating_path: The path to the CSV which contains the raw dataset.
+    cache_path: The path to the file where results of this function are saved.
     match_mlperf: If True, change the sorting algorithm to match the MLPerf
       reference implementation.
 
@@ -101,6 +102,9 @@ def _filter_index_sort(raw_rating_path, cache_path, match_mlperf):
 
     cache_age = time.time() - cached_data.get("create_time", 0)
     if cache_age > rconst.CACHE_INVALIDATION_SEC:
+      valid_cache = False
+
+    if cached_data["match_mlperf"] != match_mlperf:
       valid_cache = False
 
     for key in _EXPECTED_CACHE_KEYS:
@@ -181,7 +185,8 @@ def _filter_index_sort(raw_rating_path, cache_path, match_mlperf):
                               .values.astype(rconst.ITEM_DTYPE),
         rconst.USER_MAP: user_map,
         rconst.ITEM_MAP: item_map,
-        "create_time": time.time()
+        "create_time": time.time(),
+        "match_mlperf": match_mlperf,
     }
 
     tf.logging.info("Writing raw data cache.")
@@ -189,19 +194,16 @@ def _filter_index_sort(raw_rating_path, cache_path, match_mlperf):
       pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
   # TODO(robieta): MLPerf cache clear.
-  return data
+  return data, valid_cache
 
 
-def instantiate_pipeline(dataset, data_dir, match_mlperf,
-                         deterministic, params):
-  # type: (str, str, bool, bool, dict) -> (NCFDataset, typing.Callable)
+def instantiate_pipeline(dataset, data_dir, deterministic, params):
+  # type: (str, str, bool, dict) -> (NCFDataset, typing.Callable)
   """Load and digest data CSV into a usable form.
 
   Args:
     dataset: The name of the dataset to be used.
     data_dir: The root directory of the dataset.
-    match_mlperf: If True, change the behavior of the cache construction to
-      match the MLPerf reference implementation.
     deterministic: Try to enforce repeatable behavior, even at the cost of
       performance.
   """
@@ -211,7 +213,8 @@ def instantiate_pipeline(dataset, data_dir, match_mlperf,
   raw_rating_path = os.path.join(data_dir, dataset, movielens.RATINGS_FILE)
   cache_path = os.path.join(data_dir, dataset, rconst.RAW_CACHE_FILE)
 
-  raw_data = _filter_index_sort(raw_rating_path, cache_path, match_mlperf)
+  raw_data, _ = _filter_index_sort(raw_rating_path, cache_path,
+                                   params["match_mlperf"])
   user_map, item_map = raw_data["user_map"], raw_data["item_map"]
   num_users, num_items = DATASET_TO_NUM_USERS_AND_ITEMS[dataset]
 
@@ -229,6 +232,8 @@ def instantiate_pipeline(dataset, data_dir, match_mlperf,
       maximum_number_epochs=params["train_epochs"],
       num_users=num_users,
       num_items=num_items,
+      user_map=user_map,
+      item_map=item_map,
       train_pos_users=raw_data[rconst.TRAIN_USER_KEY],
       train_pos_items=raw_data[rconst.TRAIN_ITEM_KEY],
       train_batch_size=params["batch_size"],
